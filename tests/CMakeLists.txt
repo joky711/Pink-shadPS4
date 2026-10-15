@@ -55,6 +55,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/ir_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/microinstruction.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/opcodes.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_buffer_format_to_raw.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
@@ -78,6 +79,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
     ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
     ${CMAKE_SOURCE_DIR}/src/common/io_file.cpp
     ${CMAKE_SOURCE_DIR}/src/common/number_utils.cpp
@@ -88,6 +90,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/perf_stats.cpp
     ${CMAKE_SOURCE_DIR}/src/common/rdtsc.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/signal_context.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
 
     # Stubs that replace dependencies
@@ -112,6 +115,7 @@ set(GCN_TEST_SOURCES
     video_core/test_image_barriers.cpp
     video_core/test_mapped_page_table.cpp
     gcn/test_sharp_fetch.cpp
+    gcn/test_srt_walker.cpp
     gcn/test_spirv_conformance.cpp
 )
 
@@ -139,6 +143,9 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
     half::half
+    xxHash::xxhash
+    xbyak::xbyak
+    Zydis::Zydis
 )
 
 foreach(t ${TEST_TARGETS})

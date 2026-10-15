@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -333,6 +336,9 @@ struct PassInfo {
 
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
+
+    // For the logs
+    u64 pgm_hash = 0;
 
     // Make walker loads test the clean-page bitmap when enabled
     bool clean_loads = false;
@@ -730,8 +736,8 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                  magic_enum::enum_name(inst->GetOpcode()));
+        LOG_ERROR(Render_Recompiler, "Shader {:#x}: unexpected instruction for offset computation, {}",
+                  pass_info.pgm_hash, magic_enum::enum_name(inst->GetOpcode()));
         return false;
     }
 }
@@ -836,6 +842,16 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
     return true;
 }
 
+/// Loads the walker cannot flatten are read from guest memory by the shader with direct memory access, and
+/// from flatbuf[0] (a wrong value) without it
+static void LogUncomputedOffset(const PassInfo& pass_info, const char* what) {
+    LOG_ERROR(Render_Recompiler,
+              "Failed to compute offset for SRT walker: shader {:#x}, {} {}", pass_info.pgm_hash, what,
+              EmulatorSettings.IsDirectMemoryAccessEnabled()
+                  ? "is read through direct memory access"
+                  : "reads a wrong value (enable directMemoryAccess to read it from guest memory)");
+}
+
 static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
@@ -849,7 +865,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     }
 
     if (!PushPtr(c, pass_info, off_dw)) {
-        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        LogUncomputedOffset(pass_info, "every load through this pointer");
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
@@ -867,7 +883,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             const size_t code_begin = c.getSize();
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
                 c.setSize(code_begin);
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                LogUncomputedOffset(pass_info, "scalar load");
                 continue;
             }
             c.shl(r10d, 2);
@@ -1007,11 +1023,229 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
     }
 }
 
+// Splitting scalar loads whose offset depends on a Phi
+//
+// The walker runs on the CPU before the draw and has no control flow, so it cannot compute an offset
+// such as Phi(16, 32) >> 2 (an sgpr set differently on two sides of a branch). Such a load used to stay
+// unflattened and read flatbuf[0] unless direct memory access was on. A load from constant memory has
+// no side effects, so it can run at the end of each predecessor of the Phi block instead, with that
+// predecessor's operand: each copy has a computable offset, and a new Phi merges the copies.
+//
+// Only data loads are split. A load used to build a pointer or a sharp is left alone: the pointer
+// chain and the resource tracking expect ReadConst sources, not Phis. Loop counters stay dynamic, since
+// the operand from the back edge depends on the Phi itself.
+
+constexpr size_t MaxSplitPhiOperands = 8;
+constexpr u32 MaxSplitDepth = 16;
+
+/// Pure values the walker can compute, without a Phi: immediates, user data, scalar loads and the ALU
+/// operations ComputeOffset handles
+bool IsPhiFreeWalkerValue(const IR::Value& value, u32 depth = 0) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    if (depth > MaxSplitDepth) {
+        return false;
+    }
+    const IR::Inst* inst = value.Inst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        return true;
+    case IR::Opcode::CompositeConstructU32x2:
+    case IR::Opcode::ReadConst:
+        break;
+    default:
+        if (!IsAllowedOffsetInstruction(inst) || inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+            return false;
+        }
+        break;
+    }
+    for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+        if (!IsPhiFreeWalkerValue(inst->Arg(arg), depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The single Phi an offset depends on, through ALU operations the walker computes. Other leaves must be
+/// Phi free. Returns nullptr when there is no Phi, more than one, or an operation the walker cannot compute
+IR::Inst* FindOffsetPhi(const IR::Value& value, u32 depth = 0) {
+    if (value.IsImmediate() || depth > MaxSplitDepth) {
+        return nullptr;
+    }
+    IR::Inst* inst = value.Inst();
+    if (inst->GetOpcode() == IR::Opcode::Phi) {
+        return inst;
+    }
+    if (!IsAllowedOffsetInstruction(inst) || inst->GetOpcode() == IR::Opcode::GetUserData ||
+        inst->GetOpcode() == IR::Opcode::ReadConst ||
+        inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+        return nullptr;
+    }
+    IR::Inst* phi = nullptr;
+    for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+        const IR::Value arg_value = inst->Arg(arg);
+        if (IsPhiFreeWalkerValue(arg_value, depth + 1)) {
+            continue;
+        }
+        IR::Inst* arg_phi = FindOffsetPhi(arg_value, depth + 1);
+        if (!arg_phi || (phi && phi != arg_phi)) {
+            return nullptr;
+        }
+        phi = arg_phi;
+    }
+    return phi;
+}
+
+/// True when every use reads the load as plain data
+bool IsDataOnlyLoad(IR::Inst& read_const) {
+    for (const auto& use : read_const.Uses()) {
+        const IR::Opcode op = use.user->GetOpcode();
+        if (op == IR::Opcode::Phi || op == IR::Opcode::ReadConst ||
+            op == IR::Opcode::ReadConstBuffer ||
+            magic_enum::enum_name(op).starts_with("CompositeConstruct")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Folds an offset operation on immediates. The walker expects constant propagation to have run, so its
+/// emitters assert on an operation whose arguments are all immediates
+std::optional<u32> FoldOffsetImmediates(IR::Opcode op, std::span<const IR::Value> args) {
+    if (!std::ranges::all_of(args, [](const IR::Value& v) { return v.IsImmediate(); })) {
+        return std::nullopt;
+    }
+    const auto arg = [&](size_t i) { return args[i].U32(); };
+    switch (op) {
+    case IR::Opcode::IAdd32:
+        return arg(0) + arg(1);
+    case IR::Opcode::ISub32:
+        return arg(0) - arg(1);
+    case IR::Opcode::IMul32:
+        return arg(0) * arg(1);
+    case IR::Opcode::ShiftLeftLogical32:
+        return arg(1) < 32 ? arg(0) << arg(1) : 0u;
+    case IR::Opcode::ShiftRightLogical32:
+        return arg(1) < 32 ? arg(0) >> arg(1) : 0u;
+    case IR::Opcode::BitwiseAnd32:
+        return arg(0) & arg(1);
+    case IR::Opcode::BitwiseOr32:
+        return arg(0) | arg(1);
+    case IR::Opcode::BitwiseXor32:
+        return arg(0) ^ arg(1);
+    case IR::Opcode::BitwiseNot32:
+        return ~arg(0);
+    case IR::Opcode::UMin32:
+        return std::min(arg(0), arg(1));
+    case IR::Opcode::UMax32:
+        return std::max(arg(0), arg(1));
+    case IR::Opcode::BitFieldUExtract: {
+        const u32 shift = arg(1) & 31;
+        const u32 count = arg(2);
+        const u32 value = arg(0) >> shift;
+        return count >= 32 ? value : value & ((1u << count) - 1);
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+/// Copies `value` at `pos`, the Phi replaced by `replacement`. Values that do not depend on the Phi are
+/// copied too: they are pure, may be defined after the Phi block's predecessors, and the walker deduplicates
+/// identical loads by value number
+IR::Value CloneForPredecessor(const IR::Value& value, const IR::Inst* phi, const IR::Value& replacement,
+                              IR::Block& block, IR::Block::iterator pos,
+                              std::unordered_map<const IR::Inst*, IR::Value>& cloned) {
+    if (value.IsImmediate()) {
+        return value;
+    }
+    const IR::Inst* inst = value.Inst();
+    if (inst == phi) {
+        return replacement;
+    }
+    if (const auto it = cloned.find(inst); it != cloned.end()) {
+        return it->second;
+    }
+    boost::container::small_vector<IR::Value, 3> args;
+    for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+        args.push_back(CloneForPredecessor(inst->Arg(arg), phi, replacement, block, pos, cloned));
+    }
+    IR::Value result;
+    if (const auto folded = FoldOffsetImmediates(inst->GetOpcode(), args)) {
+        result = IR::Value{*folded};
+    } else {
+        IR::Inst* copy = &*block.PrependNewInst(pos, *inst);
+        for (size_t arg = 0; arg < args.size(); ++arg) {
+            copy->SetArg(arg, args[arg]);
+        }
+        result = IR::Value{copy};
+    }
+    cloned.emplace(inst, result);
+    return result;
+}
+
+/// Splits one data load whose offset depends on a Phi. Returns true when the load was replaced
+bool SplitPhiOffsetLoad(IR::Inst& read_const) {
+    if (read_const.GetOpcode() != IR::Opcode::ReadConst || read_const.Arg(1).IsImmediate()) {
+        return false;
+    }
+    IR::Inst* const phi = FindOffsetPhi(read_const.Arg(1));
+    if (!phi || phi->NumArgs() < 2 || phi->NumArgs() > MaxSplitPhiOperands) {
+        return false;
+    }
+    if (!IsPhiFreeWalkerValue(read_const.Arg(0)) || !IsDataOnlyLoad(read_const)) {
+        return false;
+    }
+    for (size_t i = 0; i < phi->NumArgs(); ++i) {
+        // A loop counter's back edge operand depends on the Phi itself
+        if (!IsPhiFreeWalkerValue(phi->Arg(i))) {
+            return false;
+        }
+    }
+
+    IR::Block* const phi_block = phi->GetParent();
+    IR::Inst* const merged = &*phi_block->PrependNewInst(phi_block->begin(), IR::Opcode::Phi);
+    merged->SetFlags(IR::Type::U32);
+    for (size_t i = 0; i < phi->NumArgs(); ++i) {
+        IR::Block* const pred = phi->PhiBlock(i);
+        std::unordered_map<const IR::Inst*, IR::Value> cloned;
+        const IR::Value load = CloneForPredecessor(IR::Value{&read_const}, phi, phi->Arg(i), *pred,
+                                                   pred->end(), cloned);
+        merged->AddPhiOperand(pred, load);
+    }
+    read_const.ReplaceUsesWithAndRemove(IR::Value{merged});
+    return true;
+}
+
+void SplitPhiOffsetLoads(IR::Program& program) {
+    boost::container::small_vector<IR::Inst*, 16> candidates;
+    for (IR::Block* block : program.post_order_blocks) {
+        for (IR::Inst& inst : *block) {
+            if (inst.GetOpcode() == IR::Opcode::ReadConst && !inst.Arg(1).IsImmediate()) {
+                candidates.push_back(&inst);
+            }
+        }
+    }
+    u32 split = 0;
+    for (IR::Inst* inst : candidates) {
+        split += SplitPhiOffsetLoad(*inst) ? 1 : 0;
+    }
+    if (split != 0) {
+        LOG_DEBUG(Render_Recompiler, "Shader {:#x}: split {} scalar loads with a Phi offset",
+                  program.info.pgm_hash, split);
+    }
+}
+
 } // Anonymous namespace
 
 void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
+    pass_info.pgm_hash = program.info.pgm_hash;
+
+    SplitPhiOffsetLoads(program);
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source
